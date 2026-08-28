@@ -1121,7 +1121,7 @@ async def handle_connection(websocket):
                 if not content:
                     continue
 
-                log_info(f"Сообщение от {user_id} к {to_user_id}: {content[:50]}...")
+                log_info(f"Сообщение от {user_id} к {to_user_id}")
 
                 # Сохраняем сообщение в БД с reply_to
                 reply_to_json = json.dumps(reply_to) if reply_to else None
@@ -1164,7 +1164,7 @@ async def handle_connection(websocket):
                 file_name = payload.get("file_name", "")
                 data_b64 = payload.get("data", "")
 
-                log_info(f"Передача файла от {user_id} к {to_user_id}: {file_name} (image={is_image})")
+                log_info(f"Передача файла от {user_id} к {to_user_id} (image={is_image})")
 
                 if is_image:
                     # Для изображений в БД сохраняем ТОЛЬКО имя файла
