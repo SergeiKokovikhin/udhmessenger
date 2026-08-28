@@ -16,6 +16,7 @@ import os
 import json
 import base64
 import uuid
+import subprocess
 import configparser
 import asyncio
 import ssl
@@ -1466,7 +1467,9 @@ class MainWindow(QMainWindow):
         self.reg_pending_password = password
         self.auto_login_save = self.auth_dialog.autologin_checkbox.isChecked()
         self.send_json({"type": "register_code", "payload": {
-            "email": email, "code": code, "password": password}})
+            "email": email, "code": code, "password": password,
+            "computer_name": self.computer_name,
+            "os_type": self.os_type}})
 
     def handle_ws_message(self, message):
         try:
@@ -1912,8 +1915,21 @@ class MainWindow(QMainWindow):
                 tab.add_file_message(file_name, file_path, is_outgoing=False)
 
     def open_file_folder(self, file_path):
-        if file_path and sys.platform == 'win32':
-            os.system(f'explorer /select,"{file_path}"')
+        if not file_path:
+            return
+        path = os.path.normpath(file_path)
+        try:
+            if sys.platform == 'win32':
+                if os.path.isfile(path):
+                    subprocess.Popen(['explorer', '/select,', path])
+                elif os.path.isdir(path):
+                    subprocess.Popen(['explorer', path])
+            else:
+                folder = path if os.path.isdir(path) else os.path.dirname(path)
+                if folder:
+                    subprocess.Popen(['xdg-open', folder])
+        except Exception as e:
+            log_error(f"Ошибка открытия папки файла: {e}")
 
     # ------------------------------------------------------------------
     # История общений

@@ -20,6 +20,7 @@ import smtplib
 import os
 import configparser
 import hashlib
+import secrets
 import socket
 import base64
 import ssl
@@ -53,6 +54,7 @@ ALLOWED_EMAIL_DOMAINS = {"uvadrev.ru", "hk-vostok.ru"}
 
 SERVER_PORT = DEFAULT_PORT
 ADMIN_PORT = ADMIN_PORT
+ADMIN_PASSWORD = ""
 SERVER_PRIVATE_KEY_PEM = ""
 SERVER_PUBLIC_KEY_PEM = ""
 
@@ -156,10 +158,11 @@ logger = None
 # Загрузка конфигурации
 # ----------------------------------------------------------------------
 def load_config():
-    global SERVER_PORT, ADMIN_PORT, SMTP_SERVER, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, FROM_EMAIL
+    global SERVER_PORT, ADMIN_PORT, ADMIN_PASSWORD, SMTP_SERVER, SMTP_PORT, SMTP_USERNAME, SMTP_PASSWORD, FROM_EMAIL
     global SERVER_PRIVATE_KEY_PEM, SERVER_PUBLIC_KEY_PEM
 
     config = configparser.ConfigParser()
+    config_created = False
     if os.path.exists(CONFIG_FILENAME):
         config.read(CONFIG_FILENAME, encoding='utf-8')
     else:
@@ -180,8 +183,12 @@ def load_config():
             'enabled': '0',
             'level': 'INFO'
         }
+        config['admin'] = {
+            'password': secrets.token_urlsafe(16)
+        }
         with open(CONFIG_FILENAME, 'w', encoding='utf-8') as f:
             config.write(f)
+        config_created = True
         print(f"Создан конфигурационный файл {CONFIG_FILENAME}")
 
     try:
@@ -242,6 +249,25 @@ def load_config():
     SMTP_USERNAME = config.get('smtp', 'username', fallback=DEFAULT_SMTP_USERNAME)
     SMTP_PASSWORD = config.get('smtp', 'password', fallback=DEFAULT_SMTP_PASSWORD)
     FROM_EMAIL = config.get('smtp', 'from_email', fallback=DEFAULT_FROM_EMAIL)
+
+    if not config.has_section('admin'):
+        config.add_section('admin')
+    admin_password = config.get('admin', 'password', fallback='').strip()
+    if not admin_password:
+        admin_password = secrets.token_urlsafe(16)
+        config['admin']['password'] = admin_password
+        with open(CONFIG_FILENAME, 'w', encoding='utf-8') as f:
+            config.write(f)
+        log_warning(f"Задан пароль админ-панели в секции [admin] файла {CONFIG_FILENAME}")
+    elif config_created:
+        log_info(f"Пароль админ-панели записан в секцию [admin] файла {CONFIG_FILENAME}")
+    ADMIN_PASSWORD = admin_password
+
+
+def verify_admin_password(password):
+    if not ADMIN_PASSWORD or password is None:
+        return False
+    return secrets.compare_digest(str(password), str(ADMIN_PASSWORD))
 
 # ----------------------------------------------------------------------
 # Логирование
@@ -734,6 +760,7 @@ async def handle_connection(websocket):
                 email = payload.get("email")
                 code = payload.get("code")
                 password = payload.get("password")
+                os_type = payload.get("os_type", "Неизвестно")
 
                 log_info(f"Подтверждение регистрации: email={email}")
 
@@ -942,11 +969,13 @@ async def handle_connection(websocket):
                     log_debug(f"Настройки сохранены для пользователя {user_id}")
 
             # ---------- ПРОВЕРКА ВЕРСИИ КЛИЕНТА ----------
+            # Не перезаписываем сессионный user_id: лаунчер шлёт user_id=0
+            # и может работать без авторизации.
             elif msg_type == "check_client_version":
-                user_id = payload.get("user_id")
+                requester_id = payload.get("user_id")
                 current_version = payload.get("current_version", "0.0.0")
 
-                log_info(f"Проверка версии клиента: user_id={user_id}, current_version={current_version}")
+                log_info(f"Проверка версии клиента: requester_id={requester_id}, current_version={current_version}")
 
                 versions_data = load_client_versions()
                 if not versions_data:
@@ -986,10 +1015,10 @@ async def handle_connection(websocket):
 
             # ---------- СКАЧИВАНИЕ КЛИЕНТА ----------
             elif msg_type == "download_client":
-                user_id = payload.get("user_id")
+                requester_id = payload.get("user_id")
                 version = payload.get("version")
 
-                log_info(f"Скачивание клиента: user_id={user_id}, version={version}")
+                log_info(f"Скачивание клиента: requester_id={requester_id}, version={version}")
 
                 if not version:
                     await websocket.send(json.dumps({
@@ -998,11 +1027,11 @@ async def handle_connection(websocket):
                     }))
                     continue
 
-                # Разрешаем скачивание даже без user_id (для Launcher)
-                if user_id:
-                    log_info(f"Скачивание клиента пользователем {user_id}")
+                # Лаунчер скачивает без авторизации (requester_id может быть 0 / None)
+                if requester_id:
+                    log_info(f"Скачивание клиента пользователем {requester_id}")
                 else:
-                    log_info(f"Скачивание клиента (Launcher)")
+                    log_info("Скачивание клиента (Launcher)")
 
                 # Получаем путь к файлу
                 file_path = get_client_file_path(version)
@@ -1064,11 +1093,11 @@ async def handle_connection(websocket):
 
             # ---------- ПОДТВЕРЖДЕНИЕ УСТАНОВКИ ОБНОВЛЕНИЯ ----------
             elif msg_type == "update_installed":
-                user_id = payload.get("user_id")
+                requester_id = payload.get("user_id")
                 version = payload.get("version")
 
-                if user_id and version:
-                    log_info(f"Пользователь {user_id} обновил клиент до версии {version}")
+                if requester_id and version:
+                    log_info(f"Пользователь {requester_id} обновил клиент до версии {version}")
                     await websocket.send(json.dumps({
                         "type": "update_confirmed",
                         "payload": {"status": "ok"}
@@ -1277,6 +1306,7 @@ async def handle_connection(websocket):
 # Обработка админ-соединения
 # ----------------------------------------------------------------------
 async def handle_admin_connection(websocket):
+    authenticated = False
     try:
         async for raw_message in websocket:
             try:
@@ -1287,6 +1317,31 @@ async def handle_admin_connection(websocket):
 
             msg_type = message.get("type")
             payload = message.get("payload", {})
+
+            if msg_type == "admin_login":
+                if verify_admin_password(payload.get("password", "")):
+                    authenticated = True
+                    log_info("Админ-панель: успешный вход")
+                    await websocket.send(json.dumps({
+                        "type": "admin_login_success",
+                        "payload": {"message": "Авторизация успешна"}
+                    }))
+                else:
+                    authenticated = False
+                    log_warning("Админ-панель: неверный пароль")
+                    await websocket.send(json.dumps({
+                        "type": "admin_login_error",
+                        "payload": {"message": "Неверный пароль"}
+                    }))
+                continue
+
+            if not authenticated:
+                log_warning(f"Админ-панель: отказ без логина ({msg_type})")
+                await websocket.send(json.dumps({
+                    "type": "error",
+                    "payload": {"message": "Требуется авторизация. Отправьте admin_login"}
+                }))
+                continue
 
             # ---------- ОТДЕЛЫ ----------
             if msg_type == "get_departments":
@@ -1395,6 +1450,10 @@ async def handle_admin_connection(websocket):
                     if field in payload:
                         updates.append(f"{field} = ?")
                         params.append(payload[field])
+                password = (payload.get("password") or "").strip()
+                if password:
+                    updates.append("password_hash = ?")
+                    params.append(hash_password(password))
                 if updates:
                     params.append(user_id)
                     db_execute(USERS_DB_FILENAME, f"UPDATE users SET {', '.join(updates)} WHERE id = ?", tuple(params))
