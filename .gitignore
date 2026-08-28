@@ -1,0 +1,4 @@
+# Игнорируем все папки __pycache__ в проекте
+__pycache__/
+*.py[cod]
+*$py.class
